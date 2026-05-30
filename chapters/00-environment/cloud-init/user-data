@@ -1,0 +1,19 @@
+#cloud-config
+# ----------------------------------------------------------------------------
+# cloud-init "user-data": the guest runs this ONCE, on its very first boot, to
+# configure itself. An Ubuntu *cloud* image ships with no password and no user
+# you can log in as — it expects a cloud (or us) to inject config this way.
+#
+# The "#cloud-config" line on top is mandatory: it tells cloud-init this file is
+# YAML config (not a shell script).
+# ----------------------------------------------------------------------------
+
+hostname: edu-guest
+
+# Give the built-in 'ubuntu' user a password so we can log in on the serial
+# console. (For a throwaway teaching VM, a trivial password is fine.)
+password: edu
+chpasswd:
+  expire: false        # do NOT force a password change at first login
+
+ssh_pwauth: true       # allow password auth over SSH too (host port 2222 -> guest 22)
