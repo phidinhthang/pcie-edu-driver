@@ -23,12 +23,45 @@ when the CPU reads/writes those physical addresses, the read/write is routed by 
 *device's registers* instead of to RAM. The device's "datasheet" (our register map) is just offsets
 into that window: ID at `+0x00`, liveness at `+0x04`, and so on.
 
+### These registers are device *logic*, not memory
+
+A crucial point that's easy to miss: the BAR0 window is **not RAM**. We never store `0x010000ed`
+anywhere — the *device* produces it. Every offset is decoded by the device's own logic, and a read
+or write is a **transaction the device interprets however it likes**:
+
+- **ID register (`0x00`)** is hardwired to return the constant `0x010000ed` on any read; writes are
+  ignored. (A read-only identity/version register.)
+- **Liveness (`0x04`)** *stores* the value you write, but its **read path returns the bitwise
+  complement**. Read logic differs from write logic — something plain memory can never do.
+
+If you've written RTL, this is exactly the register-decode behind an AXI-Lite (or similar)
+interface — a read decode and a write decode:
+
+```
+// the mental model (pseudo-HDL)
+case (read_addr)
+  0x00: rdata <= 32'h010000ed;   // hardwired ID constant
+  0x04: rdata <= ~liveness_reg;  // read returns the complement
+case (write_addr)
+  0x04: liveness_reg <= wdata;   // store on write
+```
+
+QEMU's `edu` device (`hw/misc/edu.c`) is literally a C function doing that `case` on the offset —
+a *software model* of the register-decode you'd otherwise synthesize. So MMIO is never "write a
+value, read the same value back like memory"; it's "poke the device's logic and see what it does."
+From Chapter 3 on, that logic gets richer (write N → the device computes N!).
+
 But a kernel driver can't use a physical address directly — the CPU runs on **virtual** addresses
 through the MMU. So there are four steps, and they're distinct on purpose:
 
-1. **Enable** the device (`pci_enable_device`) — turn it on and allow it to decode accesses to its
-   BARs. A freshly-enumerated device may be in a low-power state with memory decoding off; reads
-   would return garbage.
+1. **Enable** the device (`pci_enable_device`) — this is *mostly not* about power. Its
+   operationally critical effect is flipping the **"Memory Space Enable" bit** in the device's PCI
+   *command register* (in config space, separate from BAR0). Until that bit is set, **the device
+   does not decode accesses to its BARs** — reads return all-ones (`0xffffffff`), writes vanish.
+   (It also wakes the device from a low-power D3 state if needed — that's the power angle, but the
+   decode-enable is what makes our register reads work.) A separate command bit, **bus mastering**
+   (`pci_set_master`), lets the device initiate its *own* reads/writes to host RAM — needed for DMA
+   in Chapter 5, not for poking registers, so we leave it off for now.
 2. **Reserve** the region (`pci_request_region`) — claim *ownership* of BAR0's physical range so
    two drivers can't fight over it. This is bookkeeping (it shows up in `/proc/iomem`), not mapping.
 3. **Map** it (`pci_iomap`) — ask the kernel for a **virtual address** that points at that physical
@@ -48,15 +81,32 @@ space, not memory — don't treat it like a normal pointer."** You must use the 
 
 - `ioread32(addr)` / `iowrite32(val, addr)` (and 8/16/64-bit variants).
 
-Why the accessors instead of `*reg = val;`?
+Why the accessors instead of `*reg = val;`? Because correct MMIO needs **two separate guarantees**,
+provided by two different layers:
 
-- **No compiler games.** A device register can change on its own and every access can have a side
-  effect. The accessors ensure the access actually happens, once, exactly as written — the compiler
-  can't cache, reorder, or elide it.
-- **Ordering / barriers.** MMIO needs stronger ordering than RAM; the accessors insert the right
-  barriers so writes reach the device in program order.
-- **Endianness.** `ioread32`/`iowrite32` do little-endian device access and convert to host byte
-  order. edu is little-endian; on a little-endian host it's a no-op, but the code stays portable.
+**Layer 1 — the mapping itself is uncached.** When `pci_iomap` maps BAR0, it marks those pages as
+**device / uncacheable** (via page-table/PAT attributes). So the **CPU data cache never
+participates** — every access goes out to the device, every time. There is no "second read returns
+a cached copy," because the hardware is told *don't cache this region*. This is a property of *how
+the region is mapped*, not of the accessor function.
+
+**Layer 2 — the accessors stop the *compiler* and fix ordering/endianness.** Even with an uncached
+mapping, a plain `*ptr` lets the **compiler** misbehave — cache the value in a register, hoist it
+out of a loop, reorder it, or elide a "redundant" second read. `ioread32`/`iowrite32` additionally:
+
+- **force a real access**, exactly once, in program order — the compiler can't optimize it away;
+- insert **memory barriers** so MMIO accesses are correctly ordered w.r.t. each other and w.r.t.
+  normal memory;
+- handle **endianness** — little-endian device access converted to host byte order (a no-op on a
+  little-endian host, but keeps the code portable).
+
+Why this matters: **a read can have a side effect.** Reading a status register might clear a flag;
+reading a FIFO data port might *pop* an entry — so reading twice ≠ reading once. (From the hardware
+side: a read-to-clear interrupt register, or an AXI-Stream read port.) If the compiler eliminated
+your "redundant" second read, you'd lose a FIFO word or miss an interrupt clear. edu's liveness
+register is benign, but the machinery must assume the worst because real registers bite. So both
+layers are load-bearing: **the mapping forbids CPU caching; the accessors forbid compiler
+caching/reordering and handle ordering + endianness.**
 
 So: `ioread32(edu->mmio + EDU_REG_ID)` = "do one 32-bit MMIO load from BAR0 offset 0x00." Pointer
 arithmetic on `edu->mmio` is in **bytes**, and our offsets (`0x00`, `0x04`) are byte offsets — they
