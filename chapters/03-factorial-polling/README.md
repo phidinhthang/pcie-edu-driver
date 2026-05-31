@@ -86,19 +86,24 @@ guest$ sudo insmod ./qemu_edu.ko
 guest$ sudo dmesg | tail -n 9
 ```
 
-Expected (the `polled N times` counts are timing-dependent — often `0`, since the device finishes
-before our first poll):
+Expected (the **results** are exact; the `polled N times` counts are **timing-dependent and vary
+wildly by host** — see the note after):
 
 ```
 qemu_edu 0000:00:03.0: qemu_edu: ID register = 0x010000ed -> OK
 qemu_edu 0000:00:03.0: qemu_edu: liveness 0xdeadbeef -> 0x21524110 -> OK
-qemu_edu 0000:00:03.0: qemu_edu: factorial( 0) = 1          (polled 0 times)
-qemu_edu 0000:00:03.0: qemu_edu: factorial( 1) = 1          (polled 0 times)
-qemu_edu 0000:00:03.0: qemu_edu: factorial( 5) = 120        (polled 0 times)
-qemu_edu 0000:00:03.0: qemu_edu: factorial(10) = 3628800    (polled 0 times)
-qemu_edu 0000:00:03.0: qemu_edu: factorial(12) = 479001600  (polled 0 times)
+qemu_edu 0000:00:03.0: qemu_edu: factorial( 0) = 1          (polled 186 times)
+qemu_edu 0000:00:03.0: qemu_edu: factorial( 1) = 1          (polled 143 times)
+qemu_edu 0000:00:03.0: qemu_edu: factorial( 5) = 120        (polled 161 times)
+qemu_edu 0000:00:03.0: qemu_edu: factorial(10) = 3628800    (polled 143 times)
+qemu_edu 0000:00:03.0: qemu_edu: factorial(12) = 479001600  (polled 103 times)
 qemu_edu 0000:00:03.0: qemu_edu: probe complete
 ```
+
+On a fast bare-metal host the counts can be `0` (the worker finishes before your first poll); under
+nested virtualization they're often **hundreds**, because the cost is the wake-up/scheduling latency
+of the device's worker *thread*, not the arithmetic. **Do not read meaning into the exact numbers**
+(see Pause & reflect) — only the factorial *results* are deterministic.
 
 Verify a couple by hand: `5! = 120`, `10! = 3,628,800`, `12! = 479,001,600`. Then unload:
 
@@ -110,11 +115,16 @@ guest$ sudo rmmod qemu_edu
 
 ## ⏸ Pause & reflect
 
-- **"polled 0 times" — did polling even happen?** Yes; the loop ran, checked the bit once, found it
-  already clear, and didn't spin. That's the *correct* behavior for a fast device — and it's why the
-  no-race guarantee matters: even with zero spins, the result is valid. To *see* nonzero spins you'd
-  need the device to take longer than one MMIO read; this model is too fast for that, but the
-  structure is exactly what you'd use for slow hardware.
+- **What does the poll count actually measure?** *Latency, not work.* Computing `12!` is twelve
+  multiplications (~nanoseconds); `0!` is zero. The arithmetic is negligible. The count instead
+  measures how long until the device's **worker thread** wakes, gets scheduled, and clears the bit —
+  a roughly constant cost plus scheduling jitter, **independent of N**. So a counterintuitive
+  observation like "bigger N polled *fewer* times" is real and expected: the numbers aren't a
+  function of N at all. Watch for them being **non-monotonic** and **highest on the first call** —
+  that's warm-up (cold caches, freshly-created worker thread, untrained branch predictor) settling
+  over the first few iterations. Lesson, familiar to anyone doing latency work: a micro-benchmark
+  this small is dominated by warm-up and scheduling noise, not by the thing you meant to measure.
+  (And note: even a `0`-spin result is valid — that's the no-race guarantee paying off.)
 - **The cost of polling.** While spinning, this CPU does nothing else. For microseconds that's fine;
   for a millisecond DMA it's wasteful, and inside `probe` (which can run in atomic-ish contexts in
   some paths) long spins are antisocial. This is the whole motivation for **interrupts** (Chapter 4):
